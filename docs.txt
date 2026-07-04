@@ -1,0 +1,310 @@
+1. PySpark & Databricks
+Q1. How does Spark optimize large-scale data processing?
+•	Lazy evaluation: builds a logical plan (DAG) and only executes when an action is called, allowing the Catalyst optimizer to rewrite the plan first.
+•	Catalyst optimizer: rule-based + cost-based optimization — predicate pushdown, projection pruning, constant folding, join reordering.
+•	Tungsten engine: whole-stage code generation, off-heap binary memory format (avoids JVM object overhead and GC pressure).
+•	In-memory computation across stages (vs MapReduce writing to disk between every step).
+•	Partition-level parallelism — work is split across executors/cores automatically based on partitions.
+•	Adaptive Query Execution (AQE) in Spark 3+: re-optimizes the plan at runtime — coalesces small shuffle partitions, handles skew joins, switches join strategies based on actual data size.
+Q2. Partitioning vs Bucketing — when and why?
+•	Partitioning: splits data into separate directories/files based on column value(s) (e.g., /year=2024/month=01/). Good for low-cardinality columns used in filters, enables partition pruning so Spark skips reading irrelevant folders entirely.
+•	Bucketing: splits data into a fixed number of buckets using a hash of a column, stored as files within the same directory. Good for high-cardinality columns (e.g., customer_id) and for optimizing joins/aggregations on that column — avoids shuffle if both tables are bucketed the same way.
+•	Rule of thumb: partition by date/region (coarse, used in WHERE), bucket by ID-like columns (fine-grained, used in JOIN/GROUP BY).
+•	Over-partitioning (too many small partitions, 'small file problem') hurts performance — common interview follow-up.
+Q3. Broadcast joins — when should you use them?
+•	Used when one side of a join is small enough to fit in memory on every executor (default threshold: 10MB, configurable via spark.sql.autoBroadcastJoinThreshold).
+•	Spark sends a full copy of the small table to every executor, avoiding a shuffle of the large table entirely — converts a shuffle join into a map-side join.
+•	Triggered automatically by the optimizer if size is under threshold, or forced manually with broadcast(df) hint.
+•	Avoid broadcasting when the 'small' table isn't actually small — causes executor OOM errors.
+•	In AQE, Spark can dynamically switch a sort-merge join to a broadcast join at runtime if it learns the actual size post-filter.
+
+from pyspark.sql.functions import broadcast
+result = large_df.join(broadcast(small_df), "id")
+Q4. Cache vs Persist — differences and use cases
+•	cache() is shorthand for persist() with the default storage level MEMORY_AND_DISK (or MEMORY_ONLY pre-Spark 2.0 for RDDs — for DataFrames it's MEMORY_AND_DISK by default).
+•	persist() lets you explicitly choose a storage level: MEMORY_ONLY, MEMORY_AND_DISK, DISK_ONLY, MEMORY_ONLY_SER, etc., with optional replication.
+•	Use when a DataFrame is reused multiple times in the same job (e.g., referenced in multiple downstream transformations) — avoids recomputing the lineage each time.
+•	Always unpersist() when done to free executor memory — common gotcha interviewers ask about.
+•	Caching doesn't help if the DataFrame is only used once — it adds overhead with no reuse benefit.
+Q5. Narrow vs Wide transformations
+•	Narrow: each input partition contributes to only one output partition — no shuffle needed. Examples: map, filter, union.
+•	Wide: data from multiple input partitions is needed to compute output partitions — requires a shuffle across the network. Examples: groupBy, join (non-broadcast), distinct, repartition.
+•	Wide transformations are the main performance cost in Spark jobs — minimizing them is a core optimization strategy.
+•	Narrow transformations can be pipelined within a single stage; a wide transformation creates a new stage boundary in the DAG.
+Q6. What causes shuffle, and how do you reduce it?
+•	Shuffle happens when data must be redistributed across partitions/executors — triggered by groupBy, join, distinct, repartition, orderBy.
+•	It's expensive because it involves disk I/O, network transfer, and serialization.
+•	Reduce shuffle by: using broadcast joins for small tables, pre-partitioning/bucketing data on join keys, filtering data as early as possible (predicate pushdown), using reduceByKey-style logic instead of groupByKey-style (combine before shuffling), tuning spark.sql.shuffle.partitions instead of leaving it at the default 200, and enabling AQE to auto-coalesce small shuffle partitions.
+Q7. Repartition vs Coalesce
+•	repartition(n): full shuffle, can increase or decrease partitions, results in evenly distributed data. Use when you need to increase partitions or fix skew.
+•	coalesce(n): avoids a full shuffle where possible by merging adjacent partitions — only decreases partition count, can lead to uneven partition sizes.
+•	Use coalesce when reducing partitions before writing output (e.g., avoiding too many small output files) since it's cheaper.
+•	Use repartition when you need to increase parallelism or evenly redistribute skewed data, even though it costs a shuffle.
+Q8. Spark Lazy Evaluation & DAG (high-level)
+•	Transformations (map, filter, select, join) are lazy — they just build up a logical plan, nothing executes yet.
+•	Actions (count, collect, write, show) trigger execution — Spark then optimizes the logical plan into a physical plan and builds a DAG of stages.
+•	Benefit: Spark can optimize the whole chain of transformations together (combine filters, push down predicates) rather than executing step by step.
+•	The DAG is split into stages at shuffle boundaries; each stage is split into tasks (one per partition) run in parallel across executors.
+Q9. Handling data skew in Spark
+•	Symptom: one or a few tasks take far longer than others because a key (e.g., a NULL or a dominant customer_id) has disproportionately more rows.
+•	Salting: add a random suffix/prefix to the skewed key to spread it across more partitions, join, then aggregate back.
+•	Broadcast join for the non-skewed smaller table side, avoiding shuffle on the skewed key entirely.
+•	AQE skew join optimization (Spark 3+): automatically splits skewed partitions into smaller sub-partitions during a shuffle join (spark.sql.adaptive.skewJoin.enabled).
+•	Isolate and handle skewed keys (e.g., NULLs) separately from the rest of the join, then union results.
+ 2. Delta Lake
+Q1. Delta vs Parquet
+•	Parquet is just a columnar file format — no transaction log, no ACID guarantees, no schema enforcement at write time, no built-in versioning.
+•	Delta Lake is a storage layer on top of Parquet files, adding a transaction log (_delta_log) that provides ACID transactions, schema enforcement/evolution, time travel, and unified batch+streaming reads/writes.
+•	With plain Parquet, concurrent writes can corrupt data or cause readers to see partial files; Delta's transaction log prevents this.
+•	Delta also enables efficient upserts/deletes (MERGE INTO) which plain Parquet cannot do natively.
+Q2. ACID transactions in Delta Lake
+•	Atomicity: writes either fully succeed or fully fail — no partial/corrupt files visible to readers, handled via the transaction log committing new entries atomically.
+•	Consistency: schema and constraints are enforced so the table never reflects an invalid intermediate state.
+•	Isolation: concurrent reads see a consistent snapshot (snapshot isolation) while writes happen — readers aren't blocked by in-progress writers.
+•	Durability: once committed to the transaction log, the change is permanent and recoverable, even after failures.
+•	Achieved via optimistic concurrency control — writers check for conflicts at commit time and retry if another writer committed first.
+Q3. Schema enforcement vs schema evolution
+•	Schema enforcement (default behavior): Delta rejects writes that don't match the target table's schema — protects against bad/malformed data silently corrupting a table.
+•	Schema evolution: explicitly allowing the schema to change (e.g., new columns) using mergeSchema option during writes, or autoMerge for streaming.
+•	Use enforcement as the default safety net; turn on evolution deliberately for specific pipelines, e.g., Bronze layer ingestion where upstream sources add new fields over time.
+•	Common interview point: explain that you'd use mergeSchema=true selectively rather than disabling enforcement globally, to avoid silently absorbing bad schema changes.
+
+df.write.format("delta").option("mergeSchema", "true").mode("append").save(path)
+Q4. Time Travel — real-world use cases
+•	Query previous versions of a Delta table using VERSION AS OF or TIMESTAMP AS OF, based on the transaction log history.
+•	Use cases: auditing/debugging ('what did this table look like before yesterday's bad job ran'), reproducing ML training datasets exactly, rolling back accidental bad writes/deletes, and comparing data between two points in time for data quality checks.
+•	Limited by retention settings (default 30 days) and affected by VACUUM, which physically removes old files no longer needed for time travel.
+
+SELECT * FROM my_table VERSION AS OF 12
+SELECT * FROM my_table TIMESTAMP AS OF '2026-06-01'
+Q5. OPTIMIZE & Z-ORDER — why they matter
+•	OPTIMIZE compacts many small files into larger ones (solves the 'small file problem' from frequent small writes/streaming), improving read performance by reducing file-open overhead.
+•	ZORDER BY colocates related data (rows with similar values in the given column) within the same files, improving data skipping for queries that filter on that column.
+•	Best used on columns frequently used in WHERE clauses, especially high-cardinality columns not used for partitioning.
+•	Trade-off: OPTIMIZE/Z-ORDER are compute-intensive operations — typically scheduled periodically (e.g., nightly) rather than run after every write.
+
+OPTIMIZE my_table ZORDER BY (customer_id)
+Q6. VACUUM & retention policies
+•	VACUUM physically deletes data files no longer referenced by the current table version and older than the retention threshold (default 7 days).
+•	Necessary because Delta keeps old files around to support time travel and concurrent reads — without VACUUM, storage grows indefinitely.
+•	Running VACUUM with a retention period shorter than active long-running queries/time-travel needs can break those reads — a common production gotcha.
+•	spark.databricks.delta.retentionDurationCheck.enabled can be set to false to bypass the safety check, but should be done cautiously.
+
+VACUUM my_table RETAIN 168 HOURS  -- 7 days default
+Q7. Managed vs External tables
+•	Managed table: Databricks/Unity Catalog manages both the metadata and the underlying data files. Dropping the table deletes the data too.
+•	External table: metadata is managed by Databricks, but the actual data lives at a path you specify (e.g., in ADLS) and is NOT deleted when the table is dropped.
+•	Use external tables when data needs to persist independently of the table definition, be shared across workspaces, or when you don't want accidental DROP TABLE to destroy data.
+•	Use managed tables for simpler lifecycle management when Databricks fully owns the data.
+ 3. Databricks Platform
+Q1. Job clusters vs All-purpose clusters
+•	Job clusters: created automatically when a job starts, terminated automatically when the job finishes. Cheaper (lower DBU rate) and isolated per job — no contention with other workloads.
+•	All-purpose clusters: persistent, shared, used for interactive development/notebooks, and can run multiple jobs/notebooks concurrently.
+•	Best practice: use job clusters for production scheduled pipelines (cost efficiency + isolation), all-purpose clusters for development and ad-hoc exploration.
+Q2. Single-node vs Multi-node clusters
+•	Single-node: driver and executor run on the same machine — no distributed processing. Used for small datasets, lightweight ML model training, or quick testing.
+•	Multi-node: separate driver and worker nodes, true distributed Spark processing. Used for large-scale ETL/data processing that benefits from parallelism.
+•	Choosing single-node for genuinely small workloads saves cost — multi-node has cluster coordination overhead that isn't worth it below a certain data size.
+Q3. Databricks Workflows & Job scheduling
+•	Workflows let you orchestrate multi-task pipelines (notebooks, JARs, Python scripts, SQL) with dependencies, retries, and conditional execution (run if upstream succeeds/fails).
+•	Supports triggers: cron-based schedules, file-arrival triggers, and trigger-on-completion of another job.
+•	Parameters can be passed between tasks; task values let you pass small outputs from one task to the next.
+•	Used as a lighter-weight alternative to full Airflow/ADF orchestration when everything lives inside Databricks.
+Q4. Unity Catalog — governance, lineage & access control
+•	Unity Catalog is a centralized governance layer across all Databricks workspaces — unifies metastore so catalogs/schemas/tables are consistent and discoverable account-wide.
+•	Three-level namespace: catalog.schema.table (vs the old two-level hive_metastore.schema.table).
+•	Fine-grained access control: GRANT/REVOKE at catalog, schema, table, row, and even column level (via dynamic views or column masks).
+•	Automatic data lineage: tracks column- and table-level lineage across notebooks, jobs, and dashboards — useful for impact analysis and compliance/audits.
+•	Centralized audit logging of who accessed what data and when — important for PII/compliance interview questions too.
+ 4. Data Modeling & Architecture
+Q1. Medallion Architecture (Bronze / Silver / Gold)
+•	Bronze: raw, ingested data as-is from source systems — minimal/no transformation, often append-only, kept for full historical/audit trail and reprocessing if downstream logic changes.
+•	Silver: cleaned, validated, deduplicated, conformed data — joins across sources, standardized types/formats, business-level data quality rules applied.
+•	Gold: aggregated, business-level data ready for consumption — reporting tables, fact/dimension models, feature tables for ML.
+•	Why it matters: separates concerns (raw fidelity vs. clean data vs. business logic), allows reprocessing from Bronze without re-extracting from source, and gives clear ownership boundaries between data engineering and analytics teams.
+Q2. Fact vs Dimension tables
+•	Fact tables: store measurable, quantitative business events (sales amount, quantity, transaction counts) — typically large, numeric, and append-heavy.
+•	Dimension tables: store descriptive context (customer details, product details, date attributes) used to filter/group fact data — typically smaller and slower-changing.
+•	Fact tables hold foreign keys referencing dimension tables (star schema) or chains of dimensions (snowflake schema).
+•	Interview tip: be ready to identify, given a sample scenario, which table is fact vs dimension based on whether it stores a measurable event or a descriptive attribute.
+Q3. Types of relationships (1-1, 1-M, M-M)
+•	One-to-one: each row in table A maps to exactly one row in table B (e.g., employee to employee_passport_details). Often modeled as the same table unless there's a reason to split (e.g., security/sensitivity).
+•	One-to-many: one row in table A relates to multiple rows in table B (e.g., one customer, many orders) — most common in fact/dimension modeling.
+•	Many-to-many: rows in A can relate to multiple rows in B and vice versa (e.g., students and courses) — requires a bridge/junction table holding foreign keys from both sides.
+Q4. Normalization vs performance trade-offs
+•	Normalization (3NF etc.) reduces redundancy and update anomalies — good for OLTP systems with frequent writes, but requires more joins for reads.
+•	Denormalization (common in Gold layer / data warehousing, e.g., star schema) duplicates some data to avoid expensive joins, improving read/query performance for analytics.
+•	In a Lakehouse context: Bronze/Silver often stay closer to source structure (more normalized), Gold is typically denormalized for BI tool performance.
+•	Trade-off to mention in interview: normalization optimizes for write consistency and storage, denormalization optimizes for read speed — choose based on whether the workload is OLTP-like or OLAP-like.
+Q5. Slowly Changing Dimensions (SCD Type 1, 2, 3)
+•	Type 1: overwrite old value with new value — no history kept. Simple, used when historical accuracy doesn't matter (e.g., correcting a typo in a customer's name).
+•	Type 2: insert a new row for each change, keeping full history — typically with effective_date, end_date, and is_current flag columns. Used when historical accuracy matters (e.g., tracking a customer's address at the time of each order).
+•	Type 3: add a new column to store the previous value alongside the current one — keeps only limited history (usually just the immediately prior value), used when you only need to compare 'current vs previous', not full history.
+•	In Databricks, SCD Type 2 is commonly implemented using Delta Lake's MERGE INTO statement to expire old rows and insert new ones in a single atomic operation.
+ 5. SQL & PySpark Coding
+Q1. Running balance using SQL / PySpark
+•	Use a window function with SUM() OVER (ORDER BY date) and an unbounded preceding frame to get a cumulative/running total.
+•	In PySpark, the same logic applies using Window.orderBy() with rowsBetween(Window.unboundedPreceding, Window.currentRow).
+
+-- SQL
+SELECT txn_date, amount,
+  SUM(amount) OVER (PARTITION BY account_id ORDER BY txn_date) AS running_balance
+FROM transactions;
+ 
+# PySpark
+from pyspark.sql import Window
+from pyspark.sql.functions import sum as _sum
+w = Window.partitionBy("account_id").orderBy("txn_date")\
+          .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+df.withColumn("running_balance", _sum("amount").over(w))
+Q2. LEAD & LAG (swap first & last values)
+•	LAG(col, n) looks at a row n rows before the current row in the window order; LEAD(col, n) looks ahead n rows.
+•	To 'swap first and last' in a group, a common trick is to use FIRST_VALUE / LAST_VALUE with a full window frame, combined with ROW_NUMBER to detect first/last rows, then CASE to swap them.
+•	Common interview ask: given a table, swap the value of the first row and last row within each group — solved with window functions plus a CASE expression on row_number/rank.
+
+SELECT *,
+  CASE WHEN rn = 1 THEN last_val
+       WHEN rn = total THEN first_val
+       ELSE val END AS swapped_val
+FROM (
+  SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn,
+    COUNT(*) OVER (PARTITION BY grp) AS total,
+    FIRST_VALUE(val) OVER (PARTITION BY grp ORDER BY id) AS first_val,
+    LAST_VALUE(val) OVER (PARTITION BY grp ORDER BY id
+      RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_val
+  FROM my_table
+)
+Q3. Window functions: row_number, rank, dense_rank
+•	ROW_NUMBER(): assigns a unique sequential number to each row within a partition, no gaps, no ties (ties broken arbitrarily by ORDER BY).
+•	RANK(): assigns the same rank to tied rows, but leaves gaps in the ranking sequence after ties (e.g., 1, 2, 2, 4).
+•	DENSE_RANK(): assigns the same rank to tied rows but does NOT leave gaps (e.g., 1, 2, 2, 3).
+•	Classic interview use: ROW_NUMBER() for deduplication (keep rn=1 per group), RANK()/DENSE_RANK() for 'top N per group' style problems where ties matter.
+Q4. CTEs vs Subqueries
+•	CTE (WITH clause): named, can be referenced multiple times in the same query, improves readability, supports recursion (recursive CTEs).
+•	Subquery: inline, nested, often less readable when nested multiple levels deep, cannot be reused by name within the same query.
+•	Performance is generally similar since most engines (including Spark SQL/Databricks) optimize CTEs and subqueries into similar physical plans — the main difference is readability/maintainability, not always raw speed.
+•	Use CTEs for breaking complex logic into named, sequential steps — especially useful in multi-stage transformation logic that's easier to read top-down.
+Q5. WHERE vs HAVING
+•	WHERE filters rows before aggregation (GROUP BY) happens — cannot reference aggregate functions.
+•	HAVING filters groups after aggregation — used specifically to filter on aggregate results (e.g., HAVING SUM(amount) > 1000).
+•	Putting a filter in WHERE instead of HAVING when possible is more efficient, since it reduces the row count before the (often expensive) aggregation/shuffle happens.
+Q6. Handling NULLs in joins & aggregations
+•	NULL never equals NULL in standard SQL — a join condition like a.key = b.key will not match rows where both are NULL; use IS NULL / COALESCE / <=> (null-safe equality in Spark SQL) if NULL-matching is intended.
+•	Aggregate functions like SUM, AVG, COUNT(column) ignore NULLs by default; COUNT(*) counts all rows including NULLs.
+•	In PySpark, use isNull()/isNotNull(), na.fill(), na.drop(), or coalesce() to explicitly handle NULL behavior before joins/aggregations to avoid silent data loss.
+•	A common production bug to mention: an inner join silently dropping rows because a join key is NULL on one side — worth explicitly checking null counts on join keys before joining.
+Q7. Deduplication using window functions
+•	Standard pattern: assign ROW_NUMBER() OVER (PARTITION BY <dedup_keys> ORDER BY <tiebreaker, e.g. updated_at DESC>), then filter WHERE rn = 1.
+•	Preferred over DISTINCT when you need to control which duplicate row is kept (e.g., the most recent record) rather than an arbitrary one.
+•	In PySpark, dropDuplicates() is simpler but doesn't let you control which duplicate is kept based on a tiebreaker — window function approach is used when that control matters.
+
+SELECT * FROM (
+  SELECT *, ROW_NUMBER() OVER (
+    PARTITION BY customer_id ORDER BY updated_at DESC
+  ) AS rn
+  FROM customers
+) WHERE rn = 1
+Q8. Joins (inner, left, right, full)
+•	Inner join: only matching rows from both sides.
+•	Left (outer) join: all rows from the left table, matched rows from the right (NULLs where no match).
+•	Right (outer) join: all rows from the right table, matched rows from the left.
+•	Full (outer) join: all rows from both sides, NULLs where there's no match on either side.
+•	In Spark, also worth knowing left_semi (returns left rows that have a match, but only left columns) and left_anti (returns left rows with NO match) — frequently used for filtering/exclusion logic without bringing in right-side columns.
+Q9. Regex, CASE, PIVOT, Aggregations
+•	Regex: REGEXP_EXTRACT / RLIKE in Spark SQL for pattern matching and extraction (e.g., pulling a substring matching a pattern out of a raw log string).
+•	CASE WHEN: conditional logic inline in SELECT — commonly used for bucketing values into categories or creating flags.
+•	PIVOT: turns row values into columns (e.g., turning a 'month' column's values into separate columns with aggregated values) — Spark SQL supports PIVOT natively in recent versions.
+•	Aggregations: GROUP BY with SUM/AVG/COUNT/MIN/MAX, plus GROUPING SETS / CUBE / ROLLUP for multi-level aggregation in a single query.
+Q10. SQL performance tuning
+•	Filter early (predicate pushdown) — apply WHERE clauses before joins/aggregations where possible.
+•	Avoid SELECT * — only select needed columns to reduce I/O and shuffle size (column pruning).
+•	Use appropriate join strategy — broadcast small tables, avoid cartesian joins.
+•	Partition pruning — ensure WHERE clauses use partition columns so Spark skips irrelevant files.
+•	Avoid unnecessary DISTINCT/ORDER BY on large datasets — both are expensive shuffle operations.
+•	Use EXPLAIN to inspect the physical plan and check for unexpected full scans or shuffle joins where a broadcast join was expected.
+ 6. ETL / ELT & Azure
+Q1. ETL vs ELT — when to use each
+•	ETL (Extract, Transform, Load): data is transformed before loading into the target system — common when the target system has limited compute (traditional data warehouses) or when transformation must happen for compliance/masking before data lands.
+•	ELT (Extract, Load, Transform): raw data is loaded first, transformation happens inside the powerful target system (e.g., Databricks/Snowflake) — leverages the scalability of modern cloud compute and keeps raw data available for reprocessing.
+•	Lakehouse architectures (Bronze/Silver/Gold) are inherently ELT-style: land raw data first (Bronze), then transform in-place using Spark/SQL.
+•	ELT is generally preferred in modern cloud-native pipelines because compute is cheap and scalable, and keeping raw data preserves optionality for future reprocessing.
+Q2. Azure Data Factory (ADF) components
+•	Pipeline: a logical grouping of activities that together perform a task.
+•	Activity: a single step in a pipeline — copy activity, data flow, stored procedure, notebook activity (to trigger Databricks), etc.
+•	Dataset: a named view/reference to data (a table, file, folder) that activities read from or write to.
+•	Linked Service: connection configuration to a data source/sink (like a connection string) — e.g., a Linked Service to ADLS Gen2 or a SQL Database.
+•	Trigger: defines when a pipeline runs — schedule-based, tumbling window, or event-based (e.g., file arrival in Blob/ADLS).
+Q3. Integration Runtimes (Azure IR vs Self-hosted IR)
+•	Azure IR: fully managed compute provided by Microsoft, used for cloud-to-cloud data movement and transformations — no infrastructure to manage.
+•	Self-hosted IR: software installed on an on-premises or VM machine within a private network, used when ADF needs to access data sources behind a firewall / inside a private network (on-prem SQL Server, internal file shares).
+•	Choosing factor: if any source/sink is not publicly accessible from Azure (e.g., on-prem database), a Self-hosted IR is required to bridge that network boundary.
+Q4. ADLS Gen2 vs Blob Storage
+•	ADLS Gen2 is built on top of Blob Storage but adds a hierarchical namespace — true directory/folder structure instead of Blob's flat namespace with virtual folder emulation.
+•	Hierarchical namespace enables faster directory-level operations (rename/delete a folder is a single metadata operation rather than rewriting every blob with that prefix) — important for big data workloads with many small files.
+•	ADLS Gen2 supports POSIX-style ACLs for fine-grained access control at the file/folder level, which Blob Storage alone doesn't natively support.
+•	For analytics/big-data workloads (Databricks, Synapse), ADLS Gen2 is the standard choice over plain Blob Storage because of these performance and security advantages.
+Q5. Parameterization & triggers in ADF
+•	Parameters allow pipelines/datasets/linked services to be reused dynamically (e.g., a single pipeline that processes any table name or date range passed in as a parameter) instead of hardcoding many near-duplicate pipelines.
+•	Triggers: Schedule trigger (cron-like recurring runs), Tumbling window trigger (sequential, stateful windows — good for backfill scenarios with dependency on previous window), Event-based trigger (fires on blob creation/deletion in storage).
+•	Common pattern: a parameterized pipeline driven by a config table (list of source tables, paths) combined with a ForEach activity, so adding a new source doesn't require a new pipeline.
+Q6. Error handling & retries in pipelines
+•	Activity-level retry policy: configurable retry count and interval directly on an activity for transient failures (e.g., network blips).
+•	Try/Catch pattern in ADF: use the 'On Failure' dependency condition from an activity to route to error-handling/logging activities instead of failing the whole pipeline silently.
+•	Logging failures to a dedicated audit/error table (with pipeline run ID, error message, timestamp) for traceability and alerting.
+•	Alerting: Azure Monitor alerts or Logic Apps/webhooks triggered on pipeline failure to notify the team (e.g., Teams/email/Slack).
+•	In Databricks Workflows, similar concept applies via task-level retries and 'Run if' conditions on dependent tasks.
+ 7. Streaming & Real-Time Data
+Q1. Databricks Auto Loader — how it works
+•	Auto Loader incrementally and efficiently processes new files as they arrive in cloud storage (ADLS/S3/GCS), without having to list the entire directory on every run.
+•	Uses cloudFiles source format; tracks which files have already been processed using a scalable checkpoint mechanism (RocksDB-backed) instead of expensive directory listing.
+•	Supports two file discovery modes: directory listing (default, simpler) and file notification mode (uses cloud-native event services like Azure Event Grid for very high file volumes, reducing listing overhead further).
+•	Commonly used to incrementally ingest raw files into the Bronze layer in a Structured Streaming job, often running as a continuous or trigger-once/AvailableNow job.
+
+df = (spark.readStream.format("cloudFiles")
+  .option("cloudFiles.format", "json")
+  .option("cloudFiles.schemaLocation", schema_path)
+  .load(input_path))
+Q2. Handling schema evolution in streaming
+•	Auto Loader can detect schema changes automatically and, depending on configuration, either fail the stream (default, safe) or evolve the schema and restart.
+•	cloudFiles.schemaEvolutionMode controls behavior: addNewColumns (default — adds new columns and restarts the stream), rescue (captures unexpected/mismatched data in a _rescued_data column instead of failing), failOnNewColumns, none.
+•	The _rescued_data column pattern is a key talking point — it lets a pipeline keep running even when upstream sends unexpected fields, without silently dropping data.
+•	Schema location (cloudFiles.schemaLocation) persists the inferred schema across stream restarts so it doesn't have to re-infer from scratch each time.
+Q3. Building reliable streaming pipelines
+•	Use checkpointing (checkpointLocation) so the stream can recover its exact progress after a failure or restart, avoiding data loss or duplication.
+•	Choose the right trigger: continuous processing trigger for low-latency, or Trigger.AvailableNow / trigger(once=True) for batch-like, cost-efficient 'process what's new since last run' style jobs — common in Databricks Workflows running on a schedule rather than 24/7 clusters.
+•	Idempotent writes — design the sink (e.g., Delta MERGE) so reprocessing the same micro-batch after a failure doesn't create duplicates.
+•	Use foreachBatch for custom sink logic (e.g., upserts into Delta) when the built-in streaming sinks don't directly support the needed write pattern.
+•	Monitor stream health via the Spark UI / Databricks streaming metrics (input rate, processing rate, batch duration) to catch backlog growth before it becomes critical.
+ 8. Data Quality & Governance
+Q1. Data quality checks (nulls, duplicates, ranges)
+•	Null checks: validate required fields aren't null post-ingestion (e.g., primary keys, foreign keys) — often enforced via Delta constraints (ALTER TABLE ... ADD CONSTRAINT) or explicit filtering logic in Silver layer.
+•	Duplicate checks: row-count comparisons pre/post dedup, or asserting uniqueness on key columns.
+•	Range/validity checks: ensure numeric values fall within expected bounds (e.g., age between 0-120, amount >= 0), and categorical values match an expected set.
+•	Tools: Databricks has built-in Delta Live Tables (DLT) expectations (EXPECT ... ON VIOLATION) for declarative data quality rules with configurable actions (drop, fail, or just log/warn) — good to mention if the role touches DLT/pipelines.
+Q2. Handling bad records
+•	Quarantine pattern: route records failing validation to a separate 'bad records' / 'rejected' table or path rather than silently dropping them, so they can be investigated and reprocessed later.
+•	Spark's PERMISSIVE (default), DROPMALFORMED, and FAILFAST modes control behavior when reading malformed records (e.g., malformed JSON/CSV) — PERMISSIVE puts unparsable fields into a _corrupt_record column instead of failing the whole read.
+•	Auto Loader's rescued data column (mentioned above) is a similar concept specific to schema mismatches in streaming ingestion.
+•	Always log the reason for rejection (which rule failed, what the bad value was) alongside the quarantined record — makes root-causing upstream issues much faster.
+Q3. Logging & monitoring pipelines
+•	Centralized logging: write pipeline run metadata (start/end time, row counts in/out, status, error messages) to a dedicated audit/log table for every run.
+•	Databricks-native: job/task run history, cluster event logs, and Spark UI metrics (stage/task durations, shuffle read/write, spill) for performance debugging.
+•	Azure-native: Azure Monitor / Log Analytics for centralized cross-service monitoring, alerting on failures or SLA breaches (e.g., pipeline running longer than expected).
+•	Row-count reconciliation between source and target (or between Bronze→Silver→Gold) is a simple but very commonly expected data quality monitoring practice.
+Q4. Audit columns (created_date, updated_date, batch_id)
+•	created_date / created_at: timestamp when the record was first inserted — never updated afterward.
+•	updated_date / updated_at: timestamp of the most recent modification — critical for incremental/CDC-style processing (pick up only rows changed since the last run).
+•	batch_id / run_id: identifies which pipeline run/job execution inserted or modified a record — essential for tracing issues back to a specific run and for reprocessing/rollback.
+•	source_system: useful when a table consolidates data from multiple upstream systems, to trace lineage back to origin.
+•	These columns are foundational for incremental loads, debugging, and auditability — almost always expected in Bronze/Silver tables in a real production pipeline.
+Q5. Role-based access control
+•	In Unity Catalog: GRANT/REVOKE privileges (SELECT, MODIFY, CREATE, etc.) to users/groups at catalog, schema, or table level — groups are preferred over individual users for maintainability.
+•	Principle of least privilege: grant only the access level needed for a role's function (e.g., analysts get SELECT on Gold only, engineers get broader access to Bronze/Silver).
+•	Row-level and column-level security achievable via dynamic views (filtering rows based on current_user()) or Unity Catalog column masks for sensitive fields.
+•	RBAC should be combined with group-based identity management (e.g., Azure AD groups synced into the workspace) rather than managing permissions per individual user.
+Q6. PII masking & compliance
+•	Column-level masking: Unity Catalog supports dynamic column masks that show real data to authorized roles and masked/redacted data (e.g., last 4 digits only) to others, based on the querying user's group.
+•	Tokenization/hashing: replacing PII with irreversible hashes or reversible tokens at ingestion (Bronze→Silver) so downstream Gold/analytics layers never need to handle raw PII at all.
+•	Compliance frameworks commonly referenced: GDPR (right to be forgotten — needs ability to delete a specific individual's data across all Delta tables, supported via DELETE + VACUUM), and regional data residency requirements.
+•	Data classification tagging (e.g., tagging columns as 'PII' or 'sensitive' in Unity Catalog) helps automate governance and makes audits/compliance reporting far easier than manual tracking.

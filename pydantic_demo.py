@@ -1,6 +1,7 @@
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
-from typing import TypedDict, Optional, Literal, List, Annotated
+from pydantic import BaseModel, Field
+from typing import Optional, Literal, List, Annotated
 
 load_dotenv()
 
@@ -8,13 +9,13 @@ model = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
 
 #schema
 
-class Review(TypedDict):
+class Review(BaseModel):
 
-    key_themes: Annotated[list[str], "write down all key themes discussed in review."]
-    summary: Annotated[str, "A brief summary of review"]
-    sentiment: Annotated[str, "Return the sentiment either negative, positive or neutral"]
-    pros: Annotated[Optional[List[str]], "List of pros mentioned in review."]
-    cons: Annotated[Optional[List[str]], "List of cons mentioned in review."]
+    key_themes: list[str] = Field(description = "write down all key themes discussed in review.")
+    summary: str = Field(description = "A brief summary of review")
+    sentiment:Literal["positive", "negative", "neutral"] = Field(description = "Return the sentiment either negative, positive or neutral")
+    pros:Optional[List[str]] = Field (default=None,description = "List of pros mentioned in review.")
+    cons:Optional[List[str]] = Field (default=None, description = "List of cons mentioned in review.")
 
 structured_model = model.with_structured_output(Review)
 
@@ -35,5 +36,12 @@ Review by Jack
 """)
 
 print(result)
-print(result['summary'])
-print(result['sentiment'])
+
+## Accessing individual fields
+print(result.summary)
+
+## convert to dictionary
+print(result.model_dump())
+
+### convert to json
+print(result.model_dump_json(indent=2))
